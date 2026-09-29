@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+!/usr/bin/env python3
 """
 Yindii Singapore, multi-source new-business radar (v3).
 
@@ -91,36 +91,55 @@ MUIS_OFFICIAL = "https://halal.muis.gov.sg/halal/establishments"
 
 # ---------------------------------------------------------------- ICP A: merchant
 MERCHANT_SSIC: dict[str, tuple[int, str, tuple[str, ...]]] = {
-    "56102": (5, "Cafe / Coffee Chain", ("cafe", "coffee house")),
-    "47213": (5, "Premium Bakery Chain", ("confectionery and bakery", "bakery products")),
-    "56101": (4, "Hot-Meal QSR Chain", ("licensed restaurant", "restaurants")),
-    "56103": (4, "Multi-tenant operator", ("food court", "eating house", "coffee shop")),
+    # SSIC 2020 codes as ACRA actually uses them. Verified against SingStat's
+    # official listing, 29 Sep 2026. An earlier version used 56101/56102, which
+    # do not exist in SSIC 2020, so every new cafe and restaurant was missed.
+    "56112": (5, "Cafe / Coffee Chain", ("cafe",)),
+    "10712": (5, "Premium Bakery Chain", ("bread, cakes and confectionery",)),
+    "47213": (5, "Premium Bakery Chain", ("confectionery and bakery",)),
+    "56111": (4, "Hot-Meal QSR Chain", ("restaurants",)),
+    "56121": (4, "Hot-Meal QSR Chain", ("fast food",)),
+    "10719": (4, "Premium Bakery Chain", ("bakery products n.e.c",)),
     "47101": (4, "Grocer / Supermarket", ("supermarket", "hypermarket")),
+    "55101": (4, "Hotel", ("hotels",)),
+    "56122": (3, "Multi-tenant operator", ("food courts", "coffee shops", "canteens")),
+    "56123": (3, "Cafe / Coffee Chain", ("kiosks mainly for takeaway",)),
     "47102": (3, "Convenience / Petrol Mart", ("mini-mart", "convenience store", "provision shop")),
-    "56210": (2, "Caterer / Events", ("event catering", "catering")),
+    "56200": (2, "Caterer / Events", ("food caterers",)),
     "47219": (2, "Triage manually", ("retail sale of food",)),
-    "56301": (1, "Excluded", ("bars and pubs",)),
+    "56140": (1, "Hawker stall (low fit)", ("stalls selling cooked food",)),
+    "56130": (1, "Excluded", ("pubs",)),
     "47220": (1, "Excluded", ("retail sale of beverages",)),
-    "56302": (0, "Excluded", ("night club", "discotheque", "karaoke")),
 }
 
 # ---------------------------------------------------------------- ICP B: distributor
 # ambient_likely is the HARD GATE. Cold chain has no workaround in a delivered box.
 DISTRIBUTOR_SSIC: dict[str, tuple[bool, int, str, tuple[str, ...]]] = {
-    "46304": (True, 5, "Confectionery and bakery wholesale", ("wholesale of confectionery", "bakery products")),
+    "46304": (True, 5, "Confectionery and bakery wholesale", ("wholesale of confectionery",)),
     "46303": (True, 5, "General grocery wholesale", ("general line", "groceries")),
     "46309": (True, 4, "Packaged goods wholesale n.e.c.", ("beverages and tobacco n.e.c", "dried or canned")),
+    "10711": (True, 5, "Biscuit manufacturer", ("manufacture of biscuits",)),
+    "10794": (True, 5, "Chips and crackers manufacturer", ("chips, crackers",)),
+    "10761": (True, 5, "Instant beverage manufacturer", ("instant beverages",)),
+    "10791": (True, 4, "Sauce manufacturer", ("manufacture of sauces",)),
+    "10731": (True, 4, "Cocoa manufacturer", ("cocoa and chocolate powder",)),
+    "10732": (True, 4, "Chocolate manufacturer", ("chocolate products",)),
+    "10733": (True, 4, "Confectionery manufacturer", ("non-chocolate confectionery",)),
+    "10764": (True, 4, "Tea manufacturer", ("manufacture of tea",)),
+    "10740": (True, 3, "Noodle manufacturer (check fresh vs dried)", ("noodles, vermicelli",)),
     "46301": (False, 2, "Produce wholesale (FRESH, gate fails)", ("fruits and vegetables",)),
     "46302": (False, 0, "Protein wholesale (CHILLED/FROZEN, gate fails)", ("livestock, meat, poultry", "seafood")),
     "46305": (False, 0, "Ice-cream wholesale (FROZEN, gate fails)", ("ice-cream",)),
-    "46307": (False, 0, "Liquor and beverages (REGULATED, excluded)", ("liquor", "soft drinks and beverages")),
+    "46307": (False, 0, "Liquor and beverages (REGULATED, excluded)", ("liquor",)),
     "46308": (False, 0, "Tobacco (EXCLUDED)", ("tobacco products",)),
-    "10": (True, 3, "Food manufacture (verify retail format)", ("manufacture of food",)),
+    "10750": (False, 0, "Cooked-food preparations (COLD CHAIN, gate fails)", ("cooked-food preparations", "prepared meals")),
+    "10792": (False, 0, "Soya bean products (CHILLED, gate fails)", ("soya bean products",)),
+    "10800": (False, 0, "Animal feed (not human food, excluded)", ("animal feeds",)),
+    "10": (True, 3, "Food manufacture (verify retail format)", ("manufacture of",)),
 }
+# Meat (101xx) and fish (102xx) processing are cold chain by nature.
+COLD_PREFIXES = ("101", "102")
 
-# ---------------------------------------------------------------- MUIS mapping
-# Verified against the live mirror, 17 Sep 2026: 3,982 records.
-# Counts at time of verification are in the comments.
 MUIS_TYPE_MAP: dict[str, tuple[int, str]] = {
     "Snack Bar / Bakery": (5, "Premium Bakery Chain"),      # 806, the prize
     "Restaurant": (4, "Hot-Meal QSR Chain"),                # 1685
@@ -311,6 +330,9 @@ def classify_ssic(code: str, desc: str) -> tuple[str, dict[str, Any]] | tuple[No
     if code in DISTRIBUTOR_SSIC:
         amb, s, arch, _ = DISTRIBUTOR_SSIC[code]
         return "DISTRIBUTOR", {"ambient": amb, "score": s, "archetype": arch}
+    if code.startswith(COLD_PREFIXES):
+        return "DISTRIBUTOR", {"ambient": False, "score": 0,
+                               "archetype": "Meat or fish processing (COLD CHAIN, gate fails)"}
     if code.startswith("10"):
         amb, s, arch, _ = DISTRIBUTOR_SSIC["10"]
         return "DISTRIBUTOR", {"ambient": amb, "score": s, "archetype": arch}
@@ -595,7 +617,7 @@ def source_acra(today: date, args) -> list[Signal]:
             if status and not any(s in status for s in LIVE_STATUSES):
                 continue
             code = pick(rec, "primary_ssic_code")
-            desc = pick(rec, "primary_ssic_description")
+            desc = pick(rec, "primary_ssic_description", "primary_ssic_desc", "primary_ssic_code_description")
             icp, info = classify_ssic(code, desc)
             if icp is None:
                 continue
@@ -1123,6 +1145,21 @@ def selftest() -> int:
     chk("20 outlets, expansion 5", round(big.signal_score - one.signal_score, 2), 0.60)
     chk("chain reaches HOT", big.trigger, "HOT - same week")
 
+    print("\nSSIC 2020 codes, as ACRA uses them")
+    for code, want_icp, want_arch in (
+            ("56112", "MERCHANT", "Cafe / Coffee Chain"),
+            ("56111", "MERCHANT", "Hot-Meal QSR Chain"),
+            ("56121", "MERCHANT", "Hot-Meal QSR Chain"),
+            ("10712", "MERCHANT", "Premium Bakery Chain"),
+            ("55101", "MERCHANT", "Hotel"),
+            ("10711", "DISTRIBUTOR", "Biscuit manufacturer")):
+        icp, info = classify_ssic(code, "")
+        chk(f"{code} routes to {want_icp}", (icp, info["archetype"]), (want_icp, want_arch))
+    for code in ("10750", "10800", "10109", "10200", "46302"):
+        icp, info = classify_ssic(code, "")
+        chk(f"{code} fails the ambient gate", info.get("ambient"), False)
+    chk("old non-existent code 56102 no longer matches", classify_ssic("56102", "")[0], None)
+
     print("\nregistration-age window")
     young = Signal(entity_name="NEW", days_since=45)
     old_co = Signal(entity_name="OLD", days_since=4000)
@@ -1183,4 +1220,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main()) 
