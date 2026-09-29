@@ -1,0 +1,107 @@
+name: Yindii radar
+
+# Runs the multi-source radar (ACRA, SFA, NEA, MUIS) and alerts Slack
+# when new food businesses appear. Free on a public repo, and within the free
+# minutes allowance on a private one.
+#
+# SETUP, once:
+#   1. Create a repo and put yindii_radar.py in the root.
+#   2. Put this file at .github/workflows/yindii-radar.yml
+#   3. Repo Settings > Secrets and variables > Actions > New repository secret
+#        Name:  SLACK_WEBHOOK
+#        Value: your Slack incoming webhook URL
+#      Skip this if you do not want Slack. The run still writes a CSV.
+#   4. Repo Settings > Actions > General > Workflow permissions
+#        select "Read and write permissions" so the state file can be saved.
+#   5. Actions tab > Yindii radar > Run workflow, to test it now.
+
+on:
+  schedule:
+    # 01:00 UTC daily = 09:00 Singapore. ACRA only refreshes monthly, so most
+    # runs will correctly do nothing. The point is to catch the refresh the
+    # day it lands rather than whenever someone remembers to check.
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Ignore version stamps and rescan everything"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yindii-radar
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # No pip install. The watcher is pure standard library on purpose,
+      # so there is nothing to break when a dependency publishes a new version.
+
+      - name: Self-test
+        run: python3 yindii_radar.py --selftest
+
+      - name: Run radar
+        id: radar
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          DATAGOVSG_API_KEY: ${{ secrets.DATAGOVSG_API_KEY }}
+        run: |
+          set -o pipefail
+          ARGS="--once --out yindii_radar_new.csv"
+          if [ "${{ inputs.force }}" = "true" ]; then ARGS="$ARGS --force"; fi
+          if [ -n "$SLACK_WEBHOOK" ]; then ARGS="$ARGS --webhook $SLACK_WEBHOOK"; fi
+          python3 yindii_radar.py $ARGS | tee radar_output.txt
+          if [ -f yindii_radar_new.csv ]; then
+            echo "rows=$(($(wc -l < yindii_radar_new.csv) - 1))" >> "$GITHUB_OUTPUT"
+          else
+            echo "rows=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload results
+        if: steps.radar.outputs.rows != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-${{ github.run_number }}
+          path: |
+            yindii_radar_new.csv
+            radar_output.txt
+          retention-days: 90
+
+      # The state file is what stops the radar re-alerting on businesses it has
+      # already shown you. It must persist between runs, so it is committed back.
+      - name: Save state
+        run: |
+          if [ -n "$(git status --porcelain yindii_radar_state.json)" ]; then
+            git config user.name "yindii-radar"
+            git config user.email "actions@github.com"
+            git add yindii_radar_state.json
+            git commit -m "radar state $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+          else
+            echo "No state change. Nothing to commit."
+          fi
+
+      - name: Summary
+        run: |
+          echo "### Yindii radar, $(date -u +%Y-%m-%d)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "New signals: ${{ steps.radar.outputs.rows }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -40 radar_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
