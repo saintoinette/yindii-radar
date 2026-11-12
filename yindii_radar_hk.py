@@ -75,8 +75,8 @@ FEHD_TYPES: list[tuple[str, str, int, str, bool]] = [
     ("light refreshment", "MERCHANT", 5, "Cafe / Light refreshment", True),
     ("general restaurant", "MERCHANT", 4, "Restaurant", True),
     ("siu mei", "MERCHANT", 4, "Siu mei and lo mei shop", True),
-    ("composite food", "MERCHANT", 3, "Composite food shop", True),
-    ("food factory", "DISTRIBUTOR", 3, "Food factory (verify: takeaway, central kitchen or packaged goods)", True),
+    ("composite food", "MERCHANT", 3, "Composite food shop (convenience, dessert, tea)", True),
+    ("food factory", "MERCHANT", 4, "Takeaway or bakery outlet (food factory licence)", True),
     ("marine restaurant", "MERCHANT", 2, "Marine restaurant", True),
     ("factory canteen", "MERCHANT", 1, "Factory canteen (closed catchment)", True),
     ("fresh provision", "DISTRIBUTOR", 0, "Fresh provision shop (FRESH meat or fish, gate fails)", False),
@@ -84,6 +84,55 @@ FEHD_TYPES: list[tuple[str, str, int, str, bool]] = [
     ("frozen confection", "DISTRIBUTOR", 0, "Frozen confection (COLD CHAIN, gate fails)", False),
     ("milk factory", "DISTRIBUTOR", 0, "Milk factory (CHILLED, gate fails)", False),
 ]
+
+# FEHD code tables, decoded from the live data on 12 Nov 2026 by checking which
+# businesses and addresses sit under each code. Used whenever the file's own
+# code table cannot be read.
+FEHD_TYPE_CODES: dict[str, str] = {
+    "RL": "General Restaurant Licence",        # 12,609, matches FEHD's published count
+    "RR": "Light Refreshment Restaurant Licence",  # 4,678, % Arabica and cafes
+    "MR": "Marine Restaurant Licence",         # floating restaurants
+    "FB": "Bakery Licence",                    # King Bakery, Mama Bakery
+    "FF": "Food Factory Licence",              # mostly takeaway shops and bakery outlets
+    "FP": "Fresh Provision Shop Licence",      # supermarket meat counters, wet market stalls
+    "FS": "Siu Mei and Lo Mei Shop Licence",   # roast meat shops
+    "FC": "Cold Store Licence",                # cold storage logistics firms
+    "FE": "Factory Canteen Licence",           # staff canteens, airline catering
+    "FM": "Milk Factory Licence",              # Vitasoy, Trappist Dairy
+    "FG": "Composite Food Shop Licence",       # 7-Eleven, Godiva, tea shops [CONFIRM]
+}
+FEHD_DISTRICT_CODES: dict[str, str] = {
+    "11": "Eastern", "12": "Wan Chai", "15": "Southern", "17": "Islands",
+    "18": "Central and Western", "51": "Kwun Tong", "52": "Kowloon City",
+    "53": "Wong Tai Sin", "61": "Yau Tsim", "62": "Mong Kok", "63": "Sham Shui Po",
+    "91": "Kwai Tsing", "92": "Tsuen Wan", "93": "Tuen Mun", "94": "Yuen Long",
+    "95": "Tai Po", "96": "North", "97": "Sha Tin", "98": "Sai Kung",
+}
+PLACEHOLDER_NAME = re.compile(r"^\(?\s*no\s*record(\s*found)?\s*\)?$", re.I)
+INDUSTRIAL_ADDR = re.compile(r"INDUSTRIAL|FACTORY BUILDING|WORKSHOP|FLATTED FACTORY|INDUSTRIAL ESTATE|GODOWN|WAREHOUSE")
+BAKERY_NAME = re.compile(r"BAKERY|BAKE|CAKE|PATISSERIE|BOULANGERIE|BREAD|PASTRY|餅|麵包|西餅")
+
+# CFS importer food categories. Inferred from the official registration form's
+# food types plus importer names under each code. [CONFIRM] against
+# https://ftp.cfs.gov.hk/web/files/pdf/registered_trader_en_data_dictionary.pdf
+CFS_CATEGORIES: dict[str, tuple[str, str]] = {
+    "C1": ("Cereals and grains", "ambient"),
+    "C2": ("Fruit and vegetables", "cold"),
+    "C3": ("Meat and poultry (inferred)", "cold"),
+    "C4": ("Aquatic products", "cold"),
+    "C5": ("Unclear, verify", "unknown"),
+    "C6": ("Eggs and egg products", "cold"),
+    "C7": ("Milk and dairy (inferred)", "cold"),
+    "C8": ("Frozen confections", "cold"),
+    "C9": ("Fats and oils", "ambient"),
+    "C10": ("Non-alcoholic beverages", "ambient"),
+    "C11": ("Sugars, sweets and snacks", "ambient"),
+    "C12": ("Unclear, possibly bakery products", "unknown"),
+    "C13": ("Salts, condiments and sauces", "ambient"),
+    "C14": ("Chinese herbs (inferred)", "unfit"),
+    "C15": ("Unclear, verify", "unknown"),
+    "C16": ("Health food and supplements", "unfit"),
+}
 
 # Importer register has no product category, so the name is the only hint.
 COLD_NAME = re.compile(r"SEAFOOD|SEA FOOD|MEAT|POULTRY|FROZEN|FISH|BEEF|PORK|CHICKEN|DAIRY|ICE CREAM|COLD STOR")
@@ -100,7 +149,7 @@ CR_DISTRIB = re.compile(r"FOOD|FOODS|PROVISION|GROCER|SNACK|CONFECTION|BEVERAGE|
 # Placeholder weights for HK's 18 districts. [CONFIRM] against Yindii HK's
 # real partner density and saved ratio, then edit these numbers.
 DISTRICT_WEIGHT: dict[str, int] = {
-    "central and western": 5, "wan chai": 5, "yau tsim mong": 5, "eastern": 4,
+    "central and western": 5, "wan chai": 5, "yau tsim mong": 5, "yau tsim": 5, "mong kok": 5, "eastern": 4,
     "kowloon city": 4, "kwun tong": 4, "sha tin": 4, "sham shui po": 3,
     "wong tai sin": 3, "southern": 3, "tsuen wan": 3, "kwai tsing": 3,
     "tai po": 3, "sai kung": 3, "tuen mun": 3, "yuen long": 3,
@@ -134,6 +183,10 @@ class Signal:
     next_action: str = ""
 
     def key(self) -> str:
+        if self.source == "importers":
+            # Matches the key format of the first live baseline, so the upgrade
+            # does not make 11,597 existing importers look new.
+            return f"importers|{norm(self.name)}|"
         if self.licence_or_reg:
             return f"{self.source}|{self.licence_or_reg}"
         return f"{self.source}|{norm(self.name)}|{norm(self.address)[:40]}"
@@ -240,18 +293,20 @@ def parse_fehd_xml(text: str) -> tuple[list[dict], dict[str, str], dict[str, str
     names are matched by pattern, so modest renames do not break parsing.
     """
     root = ET.fromstring(text)
-    type_map: dict[str, str] = {}
-    dist_map: dict[str, str] = {}
-    for el in root.iter():
-        tag = el.tag.upper()
-        ident = el.attrib.get("ID") or el.attrib.get("id")
-        if ident is None:
+    type_map: dict[str, str] = dict(FEHD_TYPE_CODES)
+    dist_map: dict[str, str] = dict(FEHD_DISTRICT_CODES)
+    # Code tables sit in sections such as TYPE_CODE and DIST_CODE. Read every
+    # child carrying an ID attribute and file it by the SECTION's name.
+    for section in root.iter():
+        stag = section.tag.upper()
+        target = type_map if "TYPE" in stag else dist_map if "DIST" in stag else None
+        if target is None:
             continue
-        val = _txt(el)
-        if "TYPE" in tag:
-            type_map[ident] = val
-        elif "DIST" in tag:
-            dist_map[ident] = val
+        for child in section:
+            ident = child.attrib.get("ID") or child.attrib.get("id")
+            val = _txt(child)
+            if ident and val:
+                target[ident] = val
 
     records = []
     for lp in root.iter():
@@ -291,13 +346,23 @@ def fehd_signals(text: str, source: str, today: date) -> list[Signal]:
         dcode = pick_tag(rec, r"DIST", r"DIST(RICT)?_?CODE", r"DISTRICT")
         dist = dist_map.get(dcode, dcode)
         icp, fit, arch, amb = classify_fehd(tdesc)
-        s = Signal(detected=today.isoformat(), source=source, icp=icp,
-                   name=pick_tag(rec, r"SS", r"SHOP_?SIGN", r"NAME", r"SHOPSIGN"),
+        name = pick_tag(rec, r"SS", r"SHOP_?SIGN", r"NAME", r"SHOPSIGN")
+        addr = pick_tag(rec, r"ADR", r"ADDR(ESS)?")
+        no_sign = bool(PLACEHOLDER_NAME.match(name.strip()))
+        if no_sign:
+            name = "(no shop sign)"
+        if "food factory" in (tdesc or "").lower():
+            if INDUSTRIAL_ADDR.search(addr.upper()):
+                icp, fit, arch, amb = "DISTRIBUTOR", 3, "Food factory in industrial premises (verify products)", True
+            elif BAKERY_NAME.search(name.upper()):
+                fit, arch = 5, "Bakery outlet (food factory licence)"
+        s = Signal(detected=today.isoformat(), source=source, icp=icp, name=name,
                    licence_or_reg=pick_tag(rec, r"LICNO", r"LIC_?NO", r"LICEN[CS]E_?NO"),
-                   licence_type=tdesc, archetype=arch, district=dist,
-                   address=pick_tag(rec, r"ADR", r"ADDR(ESS)?"),
+                   licence_type=tdesc, archetype=arch, district=dist, address=addr,
                    expiry=pick_tag(rec, r"EXPDATE", r"EXP(IRY)?_?DATE"),
                    fit_score=fit, district_score=district_score(dist))
+        if no_sign:
+            s.next_action = "No shop sign on the licence. Visit the address to identify it."
         if icp == "DISTRIBUTOR":
             s.ambient_gate = "PASS" if amb else "FAIL"
         out.append(s)
@@ -328,29 +393,55 @@ def jpick(rec: dict, *patterns: str) -> str:
     return ""
 
 
+def parse_categories(rec: dict) -> list[str]:
+    for v in rec.values():
+        vals = v if isinstance(v, list) else re.findall(r"C\d{1,2}", str(v)) if re.search(r"\bC\d{1,2}\b", str(v)) else []
+        codes = [str(x).strip() for x in vals if re.fullmatch(r"C\d{1,2}", str(x).strip())]
+        if codes:
+            return codes
+    return []
+
+
+def classify_importer(name: str, cats: list[str]) -> tuple[str, int, str]:
+    """Returns (ambient gate, fit, archetype). Categories first, name as backup."""
+    upper = name.upper()
+    if ALCOHOL_NAME.search(upper):
+        return "FAIL", 0, "Alcohol importer (excluded)"
+    kinds = [CFS_CATEGORIES.get(c, ("Unknown", "unknown"))[1] for c in cats]
+    ambient = [c for c in cats if CFS_CATEGORIES.get(c, ("", ""))[1] == "ambient"]
+    labels = ", ".join(CFS_CATEGORIES[c][0] for c in ambient)
+    if ambient:
+        fit = min(5, 3 + len(ambient))
+        broad = " (broadline, many categories)" if len(cats) >= 6 else ""
+        return "PASS", fit, f"Ambient: {labels}{broad}"
+    if kinds and all(k in ("cold", "unfit") for k in kinds):
+        return "FAIL", 0, "Only fresh, chilled, frozen or supplement categories"
+    if COLD_NAME.search(upper):
+        return "FAIL", 0, "Name suggests chilled or frozen (verify)"
+    if AMBIENT_NAME.search(upper):
+        return "PASS", 4, "Name suggests ambient goods"
+    return "PASS", 2, "Category unclear, verify ambient range"
+
+
 def importer_signals(text: str, today: date) -> list[Signal]:
     rows = _flatten_json(json.loads(text))
     if rows:
         show_fields("CFS importers", list(rows[0].keys()))
+        sample = {k: (str(v)[:40]) for k, v in list(rows[0].items())[:8]}
+        print(f"    sample record: {sample}", file=sys.stderr)
     out = []
     for r in rows:
         name = jpick(r, r"name.*en|en.*name|^name$|company|trader")
         if not name:
+            name = jpick(r, r"name|tc|chi|zh")
+        if not name:
             continue
-        upper = name.upper()
-        if ALCOHOL_NAME.search(upper):
-            gate, fit, arch = "FAIL", 0, "Alcohol importer (excluded)"
-        elif COLD_NAME.search(upper):
-            gate, fit, arch = "FAIL", 0, "Name suggests chilled or frozen (verify)"
-        elif AMBIENT_NAME.search(upper):
-            gate, fit, arch = "PASS", 5, "Name suggests ambient goods"
-        else:
-            gate, fit, arch = "PASS", 3, "Category unknown, verify ambient range"
-        role = jpick(r, r"type|category|role|importer|distributor")
+        cats = parse_categories(r)
+        gate, fit, arch = classify_importer(name, cats)
         out.append(Signal(detected=today.isoformat(), source="importers", icp="DISTRIBUTOR",
-                          name=name, licence_or_reg=jpick(r, r"reg.*no|registration|^no$|number"),
-                          licence_type=role or "Registered food importer or distributor",
-                          archetype=arch, address=jpick(r, r"address"),
+                          name=name, licence_or_reg=jpick(r, r"reg.*n|registration|^no$|number|licen"),
+                          licence_type=" ".join(cats) or "Registered food importer or distributor",
+                          archetype=arch, address=jpick(r, r"address|addr"),
                           expiry=jpick(r, r"expir|valid"), ambient_gate=gate, fit_score=fit))
     return out
 
@@ -397,10 +488,10 @@ def cr_signals(today: date, weeks: int = 6) -> list[Signal]:
 def detect_chains(signals: list[Signal]) -> None:
     counts: dict[str, int] = {}
     for s in signals:
-        if s.icp == "MERCHANT":
+        if s.icp == "MERCHANT" and s.name != "(no shop sign)":
             counts[norm(s.name)] = counts.get(norm(s.name), 0) + 1
     for s in signals:
-        if s.icp == "MERCHANT":
+        if s.icp == "MERCHANT" and s.name != "(no shop sign)":
             s.outlets = counts.get(norm(s.name), 1)
 
 
@@ -425,13 +516,20 @@ def process(signals: list[Signal], state: dict, today: date) -> tuple[list[Signa
     seen: dict = state.setdefault("first_seen", {})
     due_sent: set = set(state.setdefault("due_sent", []))
     baseline = not seen
+    # v1 skipped importers with no English name. On the first v2 run, record
+    # those silently as baseline so they are not reported as new.
+    upgrading = bool(seen) and state.get("v", 1) < 2
+    state["v"] = 2
     detect_chains(signals)
 
     new, due = [], []
     for s in signals:
         k = s.key()
         if k not in seen:
-            seen[k] = {"d": today.isoformat(), "b": baseline}
+            silent = upgrading and s.source == "importers"
+            seen[k] = {"d": today.isoformat(), "b": baseline or silent}
+            if silent:
+                continue
             s.first_seen, s.days_since = today.isoformat(), 0
             s.maturity_score = maturity_score(0)
             s.finalise(baseline=baseline)
@@ -597,11 +695,11 @@ def selftest() -> int:
 
     print("\nimporter register")
     imp = {s.name: s for s in importer_signals(IMPORTER_FIXTURE, d0)}
-    chk("snack importer ambient", (imp["EXAMPLE SNACK TRADING LIMITED"].ambient_gate,
-                                   imp["EXAMPLE SNACK TRADING LIMITED"].fit_score), ("PASS", 5))
+    chk("snack importer ambient by name", (imp["EXAMPLE SNACK TRADING LIMITED"].ambient_gate,
+                                           imp["EXAMPLE SNACK TRADING LIMITED"].fit_score), ("PASS", 4))
     chk("frozen seafood excluded", imp["EXAMPLE FROZEN SEAFOOD CO LTD"].ambient_gate, "FAIL")
     chk("wine importer excluded", imp["EXAMPLE WINE CELLAR LIMITED"].ambient_gate, "FAIL")
-    chk("unknown category kept for checking", imp["EXAMPLE GENERAL TRADING LIMITED"].fit_score, 3)
+    chk("unknown category kept for checking", imp["EXAMPLE GENERAL TRADING LIMITED"].fit_score, 2)
     chk("registration number captured", imp["EXAMPLE SNACK TRADING LIMITED"].licence_or_reg, "TR-0001")
 
     print("\nbaseline, then new, then day-90 due")
@@ -627,6 +725,58 @@ def selftest() -> int:
                              d2 + timedelta(days=1))
     chk("DUE only fires once", len(due), 0)
     chk("baseline businesses never go DUE", "fehd_food|2218800001" in state["due_sent"], False)
+
+    print("\nreal 2026 file format: codes only, no readable code table")
+    real_xml = """<DATA><LPS>
+      <LP><TYPE>FF</TYPE><DIST>18</DIST><LICNO>2918811534</LICNO><SS>SAINT HONORE CAKE SHOP</SS>
+          <ADR>SHOP 1, G/F, CENTRAL</ADR><EXPDATE>2027-12-15</EXPDATE></LP>
+      <LP><TYPE>FF</TYPE><DIST>51</DIST><LICNO>2951805468</LICNO><SS>BAKERY CORNER</SS>
+          <ADR>ROOM 5, 7/F, MEI HING INDUSTRIAL BUILDING, KWUN TONG</ADR><EXPDATE>2027-04-13</EXPDATE></LP>
+      <LP><TYPE>FF</TYPE><DIST>61</DIST><LICNO>3961800001</LICNO><SS>HANA-MUSUBI</SS>
+          <ADR>SHOP 3, TSIM SHA TSUI</ADR><EXPDATE>2027-01-01</EXPDATE></LP>
+      <LP><TYPE>RR</TYPE><DIST>62</DIST><LICNO>3962800002</LICNO><SS>(NO RECORD FOUND)</SS>
+          <ADR>SHOP 4, MONG KOK</ADR><EXPDATE>2027-01-01</EXPDATE></LP>
+      <LP><TYPE>RR</TYPE><DIST>12</DIST><LICNO>3912800003</LICNO><SS>No Record</SS>
+          <ADR>SHOP 5, WAN CHAI</ADR><EXPDATE>2027-01-01</EXPDATE></LP>
+      <LP><TYPE>FC</TYPE><DIST>91</DIST><LICNO>2991800004</LICNO><SS>REAL COOL COLD STORAGE</SS>
+          <ADR>KWAI CHUNG</ADR><EXPDATE>2027-01-01</EXPDATE></LP>
+    </LPS></DATA>"""
+    rs = {s.licence_or_reg: s for s in fehd_signals(real_xml, "fehd_food", d0)}
+    chk("FF decoded without a code table", rs["2918811534"].licence_type, "Food Factory Licence")
+    chk("district 18 decoded", rs["2918811534"].district, "Central and Western")
+    chk("district 61 decoded", rs["3961800001"].district, "Yau Tsim")
+    chk("FF bakery outlet is a top merchant", (rs["2918811534"].icp, rs["2918811534"].fit_score), ("MERCHANT", 5))
+    chk("FF takeaway outlet is a merchant", (rs["3961800001"].icp, rs["3961800001"].fit_score), ("MERCHANT", 4))
+    chk("FF in industrial building is a distributor", rs["2951805468"].icp, "DISTRIBUTOR")
+    chk("cold store fails the gate", rs["2991800004"].ambient_gate, "FAIL")
+    chk("placeholder name relabelled", rs["3962800002"].name, "(no shop sign)")
+    detect_chains(list(rs.values()))
+    chk("no-sign premises never form a chain", rs["3962800002"].outlets, 1)
+
+    print("\nimporter categories")
+    cat_json = json.dumps([
+        {"name_en": "BROADLINE FOODS LIMITED", "category": ["C1", "C9", "C10", "C11", "C13", "C4", "C2"]},
+        {"name_en": "OCEAN SEAFOOD LIMITED", "category": ["C4"]},
+        {"name_en": "HEALTH WELLNESS LIMITED", "category": ["C16"]},
+        {"name_en": "TEA HOUSE LIMITED", "category": ["C10"]},
+        {"name_tc": "某某食品有限公司", "category": ["C13"]}])
+    ci = {s.name: s for s in importer_signals(cat_json, d0)}
+    chk("broadline ambient importer scores 5", (ci["BROADLINE FOODS LIMITED"].ambient_gate,
+                                                ci["BROADLINE FOODS LIMITED"].fit_score), ("PASS", 5))
+    chk("broadline flagged", "broadline" in ci["BROADLINE FOODS LIMITED"].archetype, True)
+    chk("seafood-only importer excluded", ci["OCEAN SEAFOOD LIMITED"].ambient_gate, "FAIL")
+    chk("supplements-only importer excluded", ci["HEALTH WELLNESS LIMITED"].ambient_gate, "FAIL")
+    chk("single ambient category passes", (ci["TEA HOUSE LIMITED"].ambient_gate,
+                                            ci["TEA HOUSE LIMITED"].fit_score), ("PASS", 4))
+    chk("Chinese-name-only importer kept", "某某食品有限公司" in ci, True)
+
+    print("\nupgrade from the first live baseline")
+    st = {"first_seen": {"importers|BROADLINE FOODS|": {"d": "2026-11-12", "b": True}}, "due_sent": []}
+    new_u, _, _ = process(importer_signals(cat_json, d0), st, d0)
+    chk("upgrade run reports no importers as new", len(new_u), 0)
+    chk("state version bumped", st.get("v"), 2)
+    new_n, _, _ = process(importer_signals(cat_json.replace("TEA HOUSE", "NEW TEA"), d0), st, d0)
+    chk("after upgrade, a genuinely new importer is reported", [s.name for s in new_n], ["NEW TEA LIMITED"])
 
     print("\ndistrict weights")
     chk("central and western high", district_score("Central and Western"), 5)
