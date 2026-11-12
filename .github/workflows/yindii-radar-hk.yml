@@ -1,0 +1,85 @@
+name: Yindii HK radar
+
+# Runs the Hong Kong radar daily: FEHD restaurant and food licences, and the
+# CFS register of food importers and distributors. No API key needed, these
+# Hong Kong files are open downloads.
+#
+# SETUP, once, in the SAME repo as the Singapore radar:
+#   1. Upload yindii_radar_hk.py to the repo root.
+#   2. Add this file as .github/workflows/yindii-radar-hk.yml
+#   3. Read and write permissions are already on from the Singapore setup.
+#   4. Actions tab > Yindii HK radar > Run workflow, to test it.
+#   The first run is a BASELINE. Real alerts start from the second run.
+
+on:
+  schedule:
+    # 02:00 UTC = 10:00 Hong Kong, an hour after FEHD's 9am daily update.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yindii-radar-shared-state
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Self-test
+        run: python3 yindii_radar_hk.py --selftest
+
+      - name: Run HK radar
+        id: radar
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          set -o pipefail
+          ARGS="--once --out yindii_radar_hk_new.csv"
+          if [ -n "$SLACK_WEBHOOK" ]; then ARGS="$ARGS --webhook $SLACK_WEBHOOK"; fi
+          python3 yindii_radar_hk.py $ARGS | tee radar_hk_output.txt
+          if [ -f yindii_radar_hk_new.csv ]; then
+            echo "rows=$(($(wc -l < yindii_radar_hk_new.csv) - 1))" >> "$GITHUB_OUTPUT"
+          else
+            echo "rows=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload results
+        if: steps.radar.outputs.rows != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: radar-hk-${{ github.run_number }}
+          path: |
+            yindii_radar_hk_new.csv
+            radar_hk_output.txt
+          retention-days: 90
+
+      - name: Save state
+        run: |
+          if [ -n "$(git status --porcelain yindii_radar_hk_state.json)" ]; then
+            git config user.name "yindii-radar"
+            git config user.email "actions@github.com"
+            git add yindii_radar_hk_state.json
+            git commit -m "hk radar state $(date -u +%Y-%m-%d) [skip ci]"
+            git pull --rebase
+            git push
+          else
+            echo "No state change."
+          fi
+
+      - name: Summary
+        run: |
+          echo "### Yindii HK radar, $(date -u +%Y-%m-%d)" >> "$GITHUB_STEP_SUMMARY"
+          echo "New or due: ${{ steps.radar.outputs.rows }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -40 radar_hk_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
