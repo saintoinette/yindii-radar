@@ -170,6 +170,7 @@ class Signal:
     archetype: str = ""
     district: str = ""
     address: str = ""
+    phone: str = ""
     expiry: str = ""
     first_seen: str = ""
     days_since: int = -1
@@ -385,6 +386,7 @@ def _flatten_json(obj: Any) -> list[dict]:
 
 
 def jpick(rec: dict, *patterns: str) -> str:
+    """First non-empty value whose key matches, trying patterns in order."""
     low = {str(k).lower(): v for k, v in rec.items()}
     for p in patterns:
         for k, v in low.items():
@@ -423,6 +425,25 @@ def classify_importer(name: str, cats: list[str]) -> tuple[str, int, str]:
     return "PASS", 2, "Category unclear, verify ambient range"
 
 
+def importer_role(rec: dict) -> str:
+    """Read the I (importer) and D (distributor) flags in foodClassification."""
+    raw = rec.get("foodClassification") or rec.get("foodclassification") or ""
+    items = raw if isinstance(raw, list) else []
+    if not items and isinstance(raw, str):
+        try:
+            import ast
+            items = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            items = []
+    imp = any(str(i.get("I", "")).upper() == "Y" for i in items if isinstance(i, dict))
+    dis = any(str(i.get("D", "")).upper() == "Y" for i in items if isinstance(i, dict))
+    if not items:
+        imp = "'I': 'Y'" in str(raw)
+        dis = "'D': 'Y'" in str(raw)
+    return ("Importer and distributor" if imp and dis else "Importer" if imp
+            else "Distributor" if dis else "Registered trader")
+
+
 def importer_signals(text: str, today: date) -> list[Signal]:
     rows = _flatten_json(json.loads(text))
     if rows:
@@ -431,17 +452,17 @@ def importer_signals(text: str, today: date) -> list[Signal]:
         print(f"    sample record: {sample}", file=sys.stderr)
     out = []
     for r in rows:
-        name = jpick(r, r"name.*en|en.*name|^name$|company|trader")
-        if not name:
-            name = jpick(r, r"name|tc|chi|zh")
+        name = jpick(r, r"^en.*name", r"name.*en", r"^name$", r"company|trader", r"name")
         if not name:
             continue
         cats = parse_categories(r)
         gate, fit, arch = classify_importer(name, cats)
+        role = importer_role(r)
         out.append(Signal(detected=today.isoformat(), source="importers", icp="DISTRIBUTOR",
-                          name=name, licence_or_reg=jpick(r, r"reg.*n|registration|^no$|number|licen"),
-                          licence_type=" ".join(cats) or "Registered food importer or distributor",
-                          archetype=arch, address=jpick(r, r"address|addr"),
+                          name=name, licence_or_reg=jpick(r, r"^trn$", r"reg.*n|registration|^no$|number|licen"),
+                          licence_type=f"{role}: {' '.join(cats)}" if cats else role,
+                          archetype=arch, address=jpick(r, r"en.*addr", r"addr"),
+                          phone=jpick(r, r"tel|phone"),
                           expiry=jpick(r, r"expir|valid"), ambient_gate=gate, fit_score=fit))
     return out
 
@@ -769,6 +790,26 @@ def selftest() -> int:
     chk("single ambient category passes", (ci["TEA HOUSE LIMITED"].ambient_gate,
                                             ci["TEA HOUSE LIMITED"].fit_score), ("PASS", 4))
     chk("Chinese-name-only importer kept", "某某食品有限公司" in ci, True)
+
+    print("\nreal CFS record shape, from the live log")
+    live = json.dumps([{"trn": "TR-11-001017", "cnBusName": "",
+                        "mainFoodCategory": "['C4', 'C2', 'C6', 'C5', 'C7', 'C1', 'C11']",
+                        "cnBusAddr": "新界葵涌國瑞路116-122號",
+                        "foodClassification": "[{'I': 'Y', 'D': 'Y', 'code': 'C2C'}]",
+                        "enBusName": "Honortry Enterprise Limited",
+                        "enBusAddr": "Flat F, 12/F, City Industrial Complex", "telNo": "24101651"},
+                       {"trn": "TR-11-000002", "cnBusName": "某食品", "mainFoodCategory": "['C10']",
+                        "cnBusAddr": "九龍", "foodClassification": "[{'I': 'N', 'D': 'Y', 'code': 'C10A'}]",
+                        "enBusName": "", "enBusAddr": "", "telNo": ""}])
+    lv = importer_signals(live, d0)
+    chk("registration number from trn", lv[0].licence_or_reg, "TR-11-001017")
+    chk("English address preferred", lv[0].address, "Flat F, 12/F, City Industrial Complex")
+    chk("phone captured", lv[0].phone, "24101651")
+    chk("importer and distributor role read", lv[0].licence_type.split(":")[0], "Importer and distributor")
+    chk("categories parsed from string", "C11" in lv[0].licence_type, True)
+    chk("Chinese name used when English is blank", lv[1].name, "某食品")
+    chk("distributor-only role read", lv[1].licence_type.split(":")[0], "Distributor")
+    chk("falls back to Chinese address", lv[1].address, "九龍")
 
     print("\nupgrade from the first live baseline")
     st = {"first_seen": {"importers|BROADLINE FOODS|": {"d": "2026-11-12", "b": True}}, "due_sent": []}
